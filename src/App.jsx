@@ -52,6 +52,7 @@ function readInitialSession() {
             ? parsed.docType
             : DEFAULT_DOC_TYPE,
         result: parsed?.result || null,
+        autoAnalyze: Boolean(parsed?.autoAnalyze),
       };
     }
   } catch {
@@ -61,17 +62,28 @@ function readInitialSession() {
     text: "",
     docType: DEFAULT_DOC_TYPE,
     result: null,
+    autoAnalyze: false,
   };
 }
 
 function saveSession(session) {
+  const payload = {
+    text: typeof session?.text === "string" ? session.text : "",
+    docType:
+      typeof session?.docType === "string" && session.docType
+        ? session.docType
+        : DEFAULT_DOC_TYPE,
+    result: session?.result || null,
+    autoAnalyze: Boolean(session?.autoAnalyze),
+  };
+
   try {
-    localStorage.setItem("ctSavedSession", JSON.stringify(session));
+    localStorage.setItem("ctSavedSession", JSON.stringify(payload));
   } catch {
     // Ignore storage errors
   }
   if (typeof chrome !== "undefined" && chrome.storage?.local) {
-    chrome.storage.local.set({ ctSavedSession: session });
+    chrome.storage.local.set({ ctSavedSession: payload });
   }
 }
 
@@ -116,7 +128,9 @@ export default function App() {
   const [statusMsg, setStatusMsg] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState(initialSession.result);
-  const [shouldAutoAnalyze, setShouldAutoAnalyze] = useState(false);
+  const [shouldAutoAnalyze, setShouldAutoAnalyze] = useState(
+    initialSession.autoAnalyze
+  );
   const [darkMode, setDarkMode] = useState(readInitialTheme);
 
   const actionsRef = useRef(null);
@@ -128,6 +142,9 @@ export default function App() {
     opacity: 0,
     stretching: false,
   });
+
+  const hasOutput = Boolean(result || error || statusMsg);
+  const isCompactPopup = !isFullView && !hasOutput;
 
   useEffect(() => {
     applyThemeClasses(darkMode);
@@ -150,6 +167,7 @@ export default function App() {
           if (typeof s.text === "string") setText(s.text);
           if (typeof s.docType === "string" && s.docType) setDocType(s.docType);
           if (s.result) setResult(s.result);
+          if (s.autoAnalyze) setShouldAutoAnalyze(true);
           try {
             localStorage.setItem("ctSavedSession", JSON.stringify(s));
           } catch {
@@ -176,12 +194,14 @@ export default function App() {
             setText("");
             setDocType(DEFAULT_DOC_TYPE);
             setResult(null);
+            setShouldAutoAnalyze(false);
           } else {
             if (typeof nextSession.text === "string") setText(nextSession.text);
             if (typeof nextSession.docType === "string" && nextSession.docType) {
               setDocType(nextSession.docType);
             }
             setResult(nextSession.result || null);
+            if (nextSession.autoAnalyze) setShouldAutoAnalyze(true);
           }
         }
       };
@@ -204,7 +224,8 @@ export default function App() {
       width: bRect.width,
       height: bRect.height,
       opacity: 1,
-      stretching: prev.opacity === 1 && Math.abs(prev.left - (bRect.left - cRect.left)) > 4,
+      stretching:
+        prev.opacity === 1 && Math.abs(prev.left - (bRect.left - cRect.left)) > 4,
     }));
   };
 
@@ -242,9 +263,14 @@ export default function App() {
     clearSavedSession();
   };
 
-  const openFullTab = () => {
+  const openFullTab = async () => {
     const shouldRunInFull = Boolean(text.trim() && !result) || loading;
-    saveSession({ text, docType, result });
+    saveSession({
+      text,
+      docType,
+      result,
+      autoAnalyze: shouldRunInFull,
+    });
     if (shouldRunInFull) {
       setShouldAutoAnalyze(true);
     }
@@ -253,6 +279,22 @@ export default function App() {
       typeof chrome !== "undefined" && chrome.runtime?.getURL
         ? chrome.runtime.getURL("index.html?view=full")
         : `${window.location.pathname}?view=full`;
+
+    if (typeof chrome !== "undefined" && chrome.tabs?.query && chrome.tabs?.update) {
+      try {
+        const allTabs = await chrome.tabs.query({});
+        const existingTab = allTabs.find((t) => t.url === url);
+        if (existingTab?.id) {
+          await chrome.tabs.update(existingTab.id, { active: true });
+          if (existingTab.windowId && chrome.windows?.update) {
+            await chrome.windows.update(existingTab.windowId, { focused: true });
+          }
+          return;
+        }
+      } catch {
+        // Fallback to creating a tab below
+      }
+    }
 
     if (typeof chrome !== "undefined" && chrome.tabs?.create) {
       chrome.tabs.create({ url });
@@ -296,7 +338,12 @@ export default function App() {
         setStatusMsg(
           `Grabbed ${grabbed.length.toLocaleString()} chars · ${DEFAULT_DOC_TYPE}`
         );
-        saveSession({ text: grabbed, docType: DEFAULT_DOC_TYPE, result: null });
+        saveSession({
+          text: grabbed,
+          docType: DEFAULT_DOC_TYPE,
+          result: null,
+          autoAnalyze: false,
+        });
       } else {
         setError(
           "No text found on page. Paste Terms, Privacy, Consent, or Cookie text."
@@ -317,8 +364,17 @@ export default function App() {
 
     if (!trimmed) {
       setError("Grab a page or paste text first.");
+      setShouldAutoAnalyze(false);
+      saveSession({ text: "", docType, result: null, autoAnalyze: false });
       return;
     }
+
+    saveSession({
+      text: trimmed,
+      docType,
+      result: null,
+      autoAnalyze: true,
+    });
 
     // Paste your actual API key inside the quotes below before running npm run build
     const apiKey = "";
@@ -328,6 +384,13 @@ export default function App() {
       apiKey === "AQ.your_actual_key_here" ||
       apiKey === "your_api_key_here"
     ) {
+      setShouldAutoAnalyze(false);
+      saveSession({
+        text: trimmed,
+        docType,
+        result: null,
+        autoAnalyze: false,
+      });
       setError("Add your Gemini API key in src/App.jsx and rebuild.");
       return;
     }
@@ -421,10 +484,12 @@ export default function App() {
 
           setDocType(resolvedDocType);
           setResult(parsed);
+          setShouldAutoAnalyze(false);
           saveSession({
             text: trimmed,
             docType: resolvedDocType,
             result: parsed,
+            autoAnalyze: false,
           });
           return;
         }
@@ -434,6 +499,13 @@ export default function App() {
 
       throw new Error(lastError || "Unable to complete analysis right now.");
     } catch (err) {
+      setShouldAutoAnalyze(false);
+      saveSession({
+        text: trimmed,
+        docType,
+        result: null,
+        autoAnalyze: false,
+      });
       setError(`Error: ${err.message}`);
     } finally {
       setStatusMsg("");
@@ -458,8 +530,8 @@ export default function App() {
     <main
       onPointerMove={handlePointerMove}
       className={`ct-popup ${isFullView ? "ct-fullpage" : ""} ${
-        darkMode ? "ct-dark" : ""
-      }`}
+        isCompactPopup ? "is-compact" : ""
+      } ${darkMode ? "ct-dark" : ""}`}
     >
       <header className="ct-header">
         <div className="ct-brand">
@@ -498,7 +570,9 @@ export default function App() {
       >
         <span
           aria-hidden="true"
-          className={`ct-liquid-thumb ${thumbStyle.stretching ? "is-stretching" : ""}`}
+          className={`ct-liquid-thumb ${
+            thumbStyle.stretching ? "is-stretching" : ""
+          }`}
           style={{
             transform: `translate3d(${thumbStyle.left}px, ${thumbStyle.top}px, 0)`,
             width: `${thumbStyle.width}px`,
@@ -552,6 +626,7 @@ export default function App() {
                 text: SAMPLE_PRIVACY,
                 docType: DEFAULT_DOC_TYPE,
                 result: null,
+                autoAnalyze: false,
               });
             }}
             className="ct-btn ct-btn-ghost"
@@ -572,7 +647,12 @@ export default function App() {
             const nextVal = e.target.value;
             setDocType(DEFAULT_DOC_TYPE);
             setText(nextVal);
-            saveSession({ text: nextVal, docType: DEFAULT_DOC_TYPE, result });
+            saveSession({
+              text: nextVal,
+              docType: DEFAULT_DOC_TYPE,
+              result,
+              autoAnalyze: false,
+            });
           }}
           placeholder="Grab page or paste Terms, Privacy, Consent, or Cookie text..."
           rows={isFullView ? 8 : 4}
